@@ -3,7 +3,6 @@ from base.message import SSMessage
 from player.parser import *
 import time
 from statistics import mean
-# from sklearn.neighbors import KNeighborsRegressor
 from scipy.spatial import KDTree
 import numpy as np
 
@@ -59,7 +58,6 @@ class R2A_QKNN(IR2A):
         self.qi = [] # store quality indices
         self.buffer_size = [] # store buffer size
         self.last_quality = None # last quality level selected
-        # self.knn = KNeighborsRegressor(n_neighbors=3)
         self.replay_buffer = [] # store (state, action, reward, next_state)
         self.fitted = False # whether the model has been fitted
         self.epsilon = 0.1 # exploration rate
