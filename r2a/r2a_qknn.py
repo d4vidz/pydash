@@ -3,7 +3,6 @@ from base.message import SSMessage
 from player.parser import *
 import time
 from statistics import mean
-# from sklearn.neighbors import KNeighborsRegressor
 from scipy.spatial import KDTree
 import numpy as np
 
