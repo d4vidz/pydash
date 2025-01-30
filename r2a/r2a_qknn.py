@@ -8,242 +8,265 @@ import numpy as np
 
 class R2A_QKNN(IR2A):
     """
-    A Rate Adaptation Algorithm that uses average throughput to select video quality.
-    This algorithm implements a simple throughput-based approach where it selects
-    the highest quality level that is below half of the average measured throughput.
-    Attributes:
-        throughputs (list): List of measured throughput values
-        request_time (float): Timestamp of the last request
-        qi (list): List of available quality levels
-    Methods:
-        handle_xml_request: Handles MPD XML requests
-        handle_xml_response: Processes MPD XML responses and calculates throughput
-        handle_segment_size_request: Selects quality level based on average throughput
-        handle_segment_size_response: Measures throughput for video segments
-        initialize: Initializes the algorithm
-        finalization: Performs cleanup operations
+    QoE-driven KNN-based rate adaptation algorithm combining Q-Learning with K-Nearest Neighbors.
+    Implements the KNN-Q Learning algorithm from the paper with buffer management and SSIM approximation.
     """
 
     def __init__(self, id):
-        """
-        Initialize the R2A_QKNN algorithm.
-
-        This class implements a QoE-driven KNN-based rate adaptation algorithm. It inherits from IR2A
-        and initializes the necessary data structures for tracking throughput measurements and
-        quality decisions.
-
-        Parameters
-        ----------
-        id : str
-            The identifier for this R2A instance.
-
-        Attributes
-        ----------
-        throughputs : list
-            Stores historical throughput measurements.
-        request_time : float
-            Tracks the timestamp of the last request.
-        qi : list
-            Stores the quality index decisions history.
-        knn : KNeighborsRegressor
-            The K-Nearest Neighbors regressor model used for quality prediction.
-        replay_buffer : list
-            Stores experience tuples (state, action, reward, next_state) for training.
-        fitted : bool
-            Indicates whether the KNN model has been fitted with data.
-        """
         IR2A.__init__(self, id)
-        self.throughputs = [] # store throughput values
-        self.request_time = 0 # store request time
-        self.qi = [] # store quality indices
-        self.buffer_size = [] # store buffer size
-        self.last_quality = None # last quality level selected
-        self.replay_buffer = [] # store (state, action, reward, next_state)
-        self.fitted = False # whether the model has been fitted
-        self.epsilon = 0.1 # exploration rate
-        self.gamma = 0.9  # discount factor
-        self.k = 3  # number of neighbors
-        self.tree : KDTree = None # KDTree for nearest neighbors
-        self.X = []  # states+actions
-        self.y = []  # rewards
+        # Algorithm parameters from paper Table II
+        self.eta = 0.3       # Learning rate
+        self.gamma = 0.95    # Discount factor
+        self.k = 3           # Number of neighbors
+        self.epsilon = 0.1   # Exploration rate (temporary)
+        
+        # Video streaming parameters
+        self.segment_duration = 2  # Hardcoded from paper (T_segment)
+        self.B_safe = 10           # Safe buffer level (sec)
+        self.alpha = 1.0           # Buffer penalty coefficients
+        self.beta = 0.001       
+        
+        # SSIM calculation defaults (from News video in paper Table I)
+        self.d = [-0.0106444, -0.0229079, -0.0253096, 0.0007417]
+        
+        # State tracking
+        self.throughputs = []     # Measured throughput values
+        self.buffer_level = 0     # Current buffer level (sec)
+        self.last_quality = None  # Last selected quality index
+        self.bitrates = []        # Available bitrates from MPD (bps)
+        self.R_max = None         # Max bitrate in representation
+        
+        # KNN-Q Learning components
+        self.replay_buffer = []   # (state, action, reward, next_state)
+        self.tree : KDTree = None          # KDTree for fast lookups
+        self.X = []               # State-action vectors
+        self.y = []               # Q-values
+        self.fitted = False
 
     def handle_xml_request(self, msg: SSMessage):
         """
-        Handles XML requests by recording the request time and sending the message downwards in the protocol stack.
-
-        The request time is stored using a high-resolution performance counter and the message is 
-        forwarded to the lower layer using send_down method from the parent class.
-
-        Args:
-            msg (SSMessage): The message object containing the XML request data.
-                SSMessage is defined in base/messages/message.py
-
-        Returns:
-            None
-
-        Note:
-            This method is part of the request-response cycle in the QoE-driven adaptation algorithm.
-            It overrides the abstract method from IR2AAlgorithm base class.
-        """
-        self.request_time = time.perf_counter() # record request time
-        self.send_down(msg) # forward message down
-
-    def handle_xml_response(self, msg: SSMessage):
-        """
-        Handles the XML response from the server containing the MPD (Media Presentation Description).
-        This method is called when an XML response is received from the server. It parses the MPD,
-        extracts the quality indices (QI), calculates and stores the throughput based on the response
-        time, and forwards the message up the stack.
+        Handles XML manifest request by recording request time.
+        
         Parameters
         ----------
         msg : SSMessage
-            The message containing the MPD XML response from the server.
-            Contains the payload and metadata about the response.
-        Notes
-        -----
-        - Updates self.qi with available quality indices from parsed MPD
-        - Calculates and stores throughput based on response size and time
-        - Forwards original message up the protocol stack
-        - Uses self.request_time which should be set when request was made
-        See Also
-        --------
-        handle_segment_size_request : Related method for handling segment size requests
+            Message object containing XML request
+        """
+        self.request_time = time.perf_counter()
+        self.send_down(msg)
+
+    def handle_xml_response(self, msg: SSMessage):
+        """
+        Processes MPD response using existing parser to initialize streaming parameters.
+        
+        Parameters
+        ----------
+        msg : SSMessage
+            Message containing MPD XML payload
         """
         parsed_mpd = parse_mpd(msg.get_payload())
+        
+        # Extract representations in MPD and calculate SSIM values
         self.qi = parsed_mpd.get_qi()
-
+        self.R_max = max(self.qi) if self.qi else 1
+        
+        # Calculate initial throughput (for first segment decision)
         t = time.perf_counter() - self.request_time
         self.throughputs.append(msg.get_bit_length() / t)
-
+        
         self.send_up(msg)
 
     def get_state(self):
         """
-        Returns the current state representation for the RL agent.
-
-        The state consists of:
-        - Average throughput of last 5 segments
-        - Current buffer level
-        - Last selected quality level
-
+        Constructs state vector from current environment observations.
+        
         Returns
         -------
         list
-            [avg_throughput, buffer_level, last_quality]
+            [current_throughput, buffer_level, last_quality]
         """
-        avg_throughput = mean(self.throughputs[-5:]) if len(self.throughputs) >= 5 else 0
-        buffer_level = mean(self.buffer_size) if self.buffer_size else 0
-        last_quality = self.last_quality if self.last_quality is not None else 0
-        return [avg_throughput, buffer_level, last_quality]
+        # Current throughput (5-segment moving average)
+        window = self.throughputs[-5:] if len(self.throughputs) >=5 else self.throughputs
+        current_throughput = mean(window) if window else 0
+        
+        return [
+            current_throughput,
+            self.buffer_level,
+            self.last_quality if self.last_quality is not None else 0
+        ]
 
-    def calculate_reward(self, quality, prev_quality, download_time, segment_size):
+    def _calculate_ssim(self, quality_idx):
         """
-        Calculates the reward based on QoE metrics.
-
+        Calculates SSIM approximation using paper's equation (1).
+        
         Parameters
         ----------
-        quality : int
-            Current quality level
-        prev_quality : int
-            Previous quality level
-        download_time : float
-            Time taken to download segment
-        segment_size : int
-            Size of segment in bits
-
+        quality_idx : int
+            Index of selected quality level
+            
         Returns
         -------
         float
-            Reward value combining bitrate, smoothness and rebuffering penalties
+            Estimated SSIM value
         """
-        bitrate_reward = quality
-        smoothness_penalty = abs(quality - prev_quality) if prev_quality is not None else 0
-        rebuffer_penalty = max(0, download_time - self.buffer_size[-1] if self.buffer_size else 0)
-        return bitrate_reward - smoothness_penalty - 4.3 * rebuffer_penalty
+        R_a = quality_idx
+        rho = np.log(R_a / self.R_max)
+        return 1 + \
+            self.d[0]*rho + \
+            self.d[1]*(rho**2) + \
+            self.d[2]*(rho**3) + \
+            self.d[3]*(rho**4)
 
-    def select_action(self):
+    def calculate_reward(self, quality, prev_quality, download_time, segment_size):
         """
-        Selects the next quality level using epsilon-greedy policy and KDTree predictions.
+        Computes QoE reward using paper's equations (4) and (5).
         
-        Uses KDTree to find nearest neighbors and predict Q-values for each possible action,
-        with random exploration based on epsilon parameter.
-
+        Parameters
+        ----------
+        quality : int
+            Current quality index
+        prev_quality : int
+            Previous quality index
+        download_time : float
+            Time taken to download segment
+        segment_size : int
+            Size of downloaded segment in bits
+            
         Returns
         -------
-        int
-            Selected quality level index
-        """        
-        # Epsilon-greedy exploration
-        if np.random.random() < self.epsilon:
-            return np.random.choice(self.qi)
+        float
+            Calculated reward value
+        """
+        # Current SSIM calculation
+        ssim = self._calculate_ssim(quality)
         
-        # Get current state
+        # Smoothness penalty (Δq)
+        if prev_quality is not None:
+            prev_ssim = self._calculate_ssim(prev_quality)
+            smoothness_penalty = abs(ssim - prev_ssim)
+        else:
+            smoothness_penalty = 0
+
+        # Buffer penalty (φ(t)) from equation (5)
+        underflow_risk = max(0, self.B_safe - self.buffer_level)
+        overflow = max(self.buffer_level - self.B_safe, 0)
+        phi = self.alpha * underflow_risk + self.beta * (overflow ** 2)
+
+        return ssim - smoothness_penalty - phi
+
+    def handle_segment_size_request(self, msg: SSMessage):
+        """
+        Handles segment request using softmax policy over KNN-predicted Q-values.
+        
+        Parameters
+        ----------
+        msg : SSMessage
+            Segment request message
+        """
+        self.request_time = time.perf_counter()
+        
+        # Softmax action selection
         state = self.get_state()
+        q_values = [self.predict(state + [a]) for a in self.qi]
+        exp_q = np.exp(np.array(q_values)/1.0)  # tau=1.0 from paper
+        probs = exp_q / np.sum(exp_q)
+        chosen_qi = np.random.choice(self.qi, p=probs)
         
-        # Find best action using KDTree predictions
-        best_q = float('-inf')
-        best_action = self.qi[0]
+        msg.add_quality_id(chosen_qi)
+        self.send_down(msg)
+
+    def handle_segment_size_response(self, msg: SSMessage):
+        """
+        Updates learning model with new experience and manages buffer state.
         
-        # Predict Q-value for each possible quality level
-        for action in self.qi:
-            state_action = state + [action]
-            q_val = self.predict(state_action) if self.fitted else 0
-            
-            if q_val > best_q:
-                best_q = q_val
-                best_action = action
-                
-        return best_action
-    
+        Parameters
+        ----------
+        msg : SSMessage
+            Received segment response
+        """
+        # Calculate download metrics
+        download_time = time.perf_counter() - self.request_time
+        current_quality = msg.get_quality_id()
+        
+        # Update buffer using paper's equation (3)
+        self.buffer_level = max(0, self.buffer_level - download_time) + self.segment_duration
+        
+        # Calculate reward and store experience
+        state = self.get_state()
+        reward = self.calculate_reward(current_quality, self.last_quality, 
+                                      download_time, msg.get_bit_length())
+        next_state = self.get_state()
+        
+        self.throughputs.append(msg.get_bit_length() / download_time)
+        self.last_quality = current_quality
+        
+        # KNN-Q update
+        self.update_replay(state, current_quality, reward, next_state)
+        self.fit_knn()
+        
+        self.send_up(msg)
+
     def update_replay(self, state, action, reward, next_state):
         """
-        Updates the replay buffer with a new transition.
-
+        Updates replay buffer and performs KNN-based Q-learning update.
+        
         Parameters
         ----------
         state : list
-            Current state
+            Current state vector
         action : int
-            Selected quality level
+            Selected quality index
         reward : float
-            Calculated reward
+            Calculated reward value
         next_state : list
-            Resulting state
+            Observed next state
         """
-        # Q-learning update
-        if len(self.replay_buffer) > 1000:  # Limit buffer size
+        # TD Target calculation
+        next_q_values = [self.predict(next_state + [a]) for a in self.qi]
+        td_target = reward + self.gamma * max(next_q_values)
+        
+        # Find nearest neighbors and update
+        if self.fitted:
+            state_action = state + [action]
+            distances, indices = self.tree.query([state_action], k=self.k)
+            
+            for idx in indices[0]:
+                if idx < len(self.y):
+                    self.y[idx] += self.eta * (td_target - self.y[idx])
+        
+        # Maintain replay buffer size
+        if len(self.replay_buffer) > 1000:
             self.replay_buffer.pop(0)
         self.replay_buffer.append((state, action, reward, next_state))
-        
+
     def fit_knn(self):
         """
-        Fits KNN model using scipy's cKDTree for efficient nearest neighbor search.
-        Transforms replay buffer into X (state+action) and y (rewards) arrays.
+        Rebuilds KDTree index from current replay buffer experiences.
         """
         if len(self.replay_buffer) > 0:
-            self.X = []
-            self.y = []
-            for (s, a, r, _) in self.replay_buffer:
-                self.X.append(s + [a])
-                self.y.append(r)
-            self.tree = KDTree(np.array(self.X))
-            self.fitted = True
+            self.X = [s + [a] for (s, a, _, _) in self.replay_buffer]
+            self.y = [r + self.gamma * max([self.predict(ns + [a]) for a in self.qi]) 
+                     for (_, _, r, ns) in self.replay_buffer]
+            
+            if len(self.X) > 0:
+                self.tree = KDTree(np.array(self.X))
+                self.fitted = True
 
-    def predict(self, state_action : list):
+    def predict(self, state_action):
         """
-        Predicts Q-value for a state-action pair using K nearest neighbors.
+        Predicts Q-value using weighted average of nearest neighbors.
         
         Parameters
         ----------
         state_action : list
-            Combined state and action vector
+            Combined state-action vector
             
         Returns
         -------
         float
-            Predicted Q-value based on nearest neighbors
+            Predicted Q-value
         """
-        if not self.fitted:
+        if not self.fitted or len(self.y) == 0:
             return 0
             
         distances, indices = self.tree.query(
@@ -254,143 +277,12 @@ class R2A_QKNN(IR2A):
         if len(indices) == 0:
             return 0
             
-        # Convert indices to proper format
-        indices = indices.flatten()
-        distances = distances.flatten()
-        
-        # Get rewards for neighbors
-        neighbor_rewards = np.array([self.y[int(i)] for i in indices])
-        
-        # Calculate weights and return weighted average
-        weights = 1.0 / (distances + 1e-6)
-        return float(np.average(neighbor_rewards, weights=weights))
-
-    def handle_segment_size_request(self, msg: SSMessage):
-        """
-        Handles segment size requests by selecting quality levels using KNN-based prediction.
-
-        This method implements the segment size request handling for the QKNN R2A algorithm.
-        It uses a trained KNN model to predict the optimal quality level based on the current
-        state (throughput history). The selection process involves:
-        1. Recording the request timestamp
-        2. Using select_action() to determine the best quality level via KNN predictions
-        3. Adding the selected quality to the message and forwarding it
-
-        Parameters
-        ----------
-        msg : SSMessage
-            A segment size message object containing the request details
-            and methods to modify the quality selection.
-
-        Returns
-        -------
-        None
-            The method sends the modified message down but does not return any value
-
-        Notes
-        -----
-        - Records request_time for throughput calculations in handle_segment_size_response
-        - Uses KNN model predictions to make quality decisions
-        - Quality selection considers historical performance through the replay buffer
-        - The modified message is sent downstream using send_down()
-        """
-        self.request_time = time.perf_counter()
-
-        chosen_qi = self.select_action()
-
-        msg.add_quality_id(chosen_qi)
-        self.send_down(msg)
-
-    def handle_segment_size_response(self, msg: SSMessage):
-        """
-        
-                Handles the segment size response from the server and updates the reinforcement learning model.
-        1. Records download time for the received segment
-        2. Gets current state by calling get_state() method
-        3. Calculates reward using calculate_reward() method based on:
-            - Current quality level
-            - Previous quality level 
-            - Download time
-            - Segment size (bit length)
-        4. Updates throughput measurements list
-        5. Stores current quality as last_quality for next iteration
-        6. Gets next state after download
-        7. Updates replay memory with (state, action, reward, next_state) tuple
-        8. Retrains KNN model by calling fit_knn()
-        9. Forwards segment message up the pipeline
-             The segment size message containing the video segment data including:
-             - Quality ID
-             - Bit length
-             - Other segment metadata
-        - Download time is measured using time.perf_counter()
-        - Throughput is calculated as: segment_bit_length / download_time 
-        - Quality ID represents the selected bitrate level
-        - The replay memory stores state transitions for reinforcement learning
-        - KNN model is retrained after each segment to adapt to network conditions
-        - Part of Q-learning based adaptive bitrate selection system
-
-        Parameters
-        ----------
-        msg : SSMessage
-            The segment size message containing the video segment data and metadata
-
-        Returns
-        -------
-        None
-            The method sends the message up but does not return any value
-
-        Notes
-        -----
-        - Throughput is calculated as: segment_size / elapsed_time
-        - The throughput values are stored in self.throughputs for later use
-        - This is part of the feedback loop for adaptive bitrate selection
-        """
-        download_time = time.perf_counter() - self.request_time
-        current_quality = msg.get_quality_id()
-        
-        state = self.get_state()
-        reward = self.calculate_reward(
-            current_quality,
-            self.last_quality,
-            download_time,
-            msg.get_bit_length()
-        )
-        
-        self.throughputs.append(msg.get_bit_length() / download_time)
-        self.last_quality = current_quality
-        
-        next_state = self.get_state()
-        self.update_replay(state, current_quality, reward, next_state)
-        self.fit_knn()
-        
-        self.send_up(msg)
+        # Weighted average of neighbor rewards
+        weights = 1 / (distances.flatten() + 1e-6)
+        return np.average([self.y[i] for i in indices.flatten()], weights=weights)
 
     def initialize(self):
-        """
-        Initialize all necessary attributes for the R2A algorithm implementation.
-
-        This method is called once during the simulation setup, before any iteration with the
-        manifest manager is performed. Attributes initialized here must support the implementation
-        of the throughput adaptation algorithm. In this implementation, it performs no specific tasks
-        but maintains compliance with the abstract base R2AAlgorithm class interface.
-
-        Raises:
-            None
-
-        Returns:
-            None
-        """
         pass
 
     def finalization(self):
-        """
-        Performs finalization/cleanup tasks when algorithm execution ends.
-
-        This method is called once at the end of the simulation to clean up any remaining resources
-        or perform final calculations. In this implementation, it performs no specific tasks
-        but maintains compliance with the abstract base R2AAlgorithm class interface.
-
-        Returns:
-            None
-        """
         pass
