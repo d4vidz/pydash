@@ -4,6 +4,7 @@ from player.parser import *
 import time
 from statistics import mean
 from scipy.spatial import KDTree
+from scipy.special import softmax
 import numpy as np
 
 class R2A_QKNN(IR2A):
@@ -18,16 +19,17 @@ class R2A_QKNN(IR2A):
         self.eta = 0.3       # Learning rate
         self.gamma = 0.95    # Discount factor
         self.k = 3           # Number of neighbors
-        self.epsilon = 0.1   # Exploration rate (temporary)
+        self.tau = 0.3       # Temperature scaling
+        # self.epsilon = 0.3   # Exploration rate (temporary)
         
         # Video streaming parameters
-        self.segment_duration = 2  # Hardcoded from paper (T_segment)
+        self.segment_duration = 1  # Hardcoded from paper (T_segment)
         self.B_safe = 10           # Safe buffer level (sec)
-        self.alpha = 1.0           # Buffer penalty coefficients
+        self.alpha = 50.0          # Penalty coefficients
         self.beta = 0.001       
         
         # SSIM calculation defaults (from News video in paper Table I)
-        self.d = [-0.0106444, -0.0229079, -0.0253096, 0.0007417]
+        self.d = [-0.0106444,-0.0229079, -0.0253096, 0.0007417]
         
         # State tracking
         self.throughputs = []     # Measured throughput values
@@ -110,12 +112,16 @@ class R2A_QKNN(IR2A):
             Estimated SSIM value
         """
         R_a = quality_idx
-        rho = np.log(R_a / self.R_max)
-        return 1 + \
+        rho = np.log10(R_a / self.R_max)
+        print(f"Rho: {rho}")
+        ssim = (1 + \
             self.d[0]*rho + \
             self.d[1]*(rho**2) + \
             self.d[2]*(rho**3) + \
-            self.d[3]*(rho**4)
+            self.d[3]*(rho**4))
+        print(f"Quality: {quality_idx}, n\ SSIM: {ssim}")
+        return(ssim)
+        
 
     def calculate_reward(self, quality, prev_quality, download_time, segment_size):
         """
@@ -143,15 +149,18 @@ class R2A_QKNN(IR2A):
         # Smoothness penalty (Δq)
         if prev_quality is not None:
             prev_ssim = self._calculate_ssim(prev_quality)
-            smoothness_penalty = abs(ssim - prev_ssim)
+            smoothness_penalty = self.alpha * abs(ssim - prev_ssim)
         else:
             smoothness_penalty = 0
 
         # Buffer penalty (φ(t)) from equation (5)
         underflow_risk = max(0, self.B_safe - self.buffer_level)
+        print(f"Buffer: {self.buffer_level}, Underflow: {underflow_risk}")
         overflow = max(self.buffer_level - self.B_safe, 0)
         phi = self.alpha * underflow_risk + self.beta * (overflow ** 2)
 
+        print(f"SSIM: {ssim}, Smoothness: {smoothness_penalty}, Phi: {phi}, Reward: {ssim - smoothness_penalty - phi}")
+        
         return ssim - smoothness_penalty - phi
 
     def handle_segment_size_request(self, msg: SSMessage):
@@ -167,9 +176,16 @@ class R2A_QKNN(IR2A):
         
         # Softmax action selection
         state = self.get_state()
-        q_values = [self.predict(state + [a]) for a in self.qi]
-        exp_q = np.exp(np.array(q_values)/1.0)  # tau=1.0 from paper
-        probs = exp_q / np.sum(exp_q)
+        q_values = np.array([self.predict(state + [a]) for a in self.qi])
+
+        # Check for NaNs or if all Q-values are the same
+        if np.any(np.isnan(q_values)):
+            # fallback, e.g. uniform distribution
+            probs = np.ones(len(self.qi)) / len(self.qi)
+        else:
+            # Compute stable softmax
+            probs = softmax(q_values / self.tau)
+
         chosen_qi = np.random.choice(self.qi, p=probs)
         
         msg.add_quality_id(chosen_qi)
