@@ -23,13 +23,13 @@ class R2A_QKNN(IR2A):
         # self.epsilon = 0.3   # Exploration rate (temporary)
         
         # Video streaming parameters
-        self.segment_duration = 1  # Hardcoded from paper (T_segment)
+        self.segment_duration = 2  # Hardcoded from paper (T_segment)
         self.B_safe = 10           # Safe buffer level (sec)
         self.alpha = 50.0          # Penalty coefficients
         self.beta = 0.001       
         
-        # SSIM calculation defaults (from News video in paper Table I)
-        self.d = [-0.0106444,-0.0229079, -0.0253096, 0.0007417]
+        # SSIM calculation vector d of BigBuckBunny
+        self.d = [0.011651186243177895,-0.012434481516153652, -0.0017859401909209828, -3.7032177029078504e-05]
         
         # State tracking
         self.throughputs = []     # Measured throughput values
