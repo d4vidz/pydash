@@ -9,70 +9,66 @@ import numpy as np
 
 class R2A_QKNN(IR2A):
     """
-    QoE-driven KNN-based rate adaptation algorithm combining Q-Learning with K-Nearest Neighbors.
-    Implements the KNN-Q Learning algorithm from the paper with buffer management and SSIM approximation.
+    Algoritmo de adaptação de taxa baseado em KNN (K-Nearest Neighbors) e Q-Learning, 
+    focado em QoE (Quality of Experience). Este algoritmo combina técnicas de aprendizado 
+    por reforço com KNN para selecionar a melhor taxa de bits para streaming de vídeo, 
+    considerando métricas como SSIM (Structural Similarity Index) e gerenciamento de buffer.
     """
 
     def __init__(self, id):
         IR2A.__init__(self, id)
-        # Algorithm parameters from paper Table II
-        self.eta = 0.3       # Learning rate
-        self.gamma = 0.95    # Discount factor
-        self.k = 3           # Number of neighbors
-        self.tau = 0.3       # Temperature scaling
-        # self.epsilon = 0.3   # Exploration rate (temporary)
+        # Parâmetros iniciais do algoritmo
+        self.eta = 0.1       # Taxa de aprendizado (learning rate)
+        self.gamma = 0.9     # Fator de desconto (discount factor)
+        self.tau = 0.5       # Escala de temperatura para softmax
+        self.alpha = 10.0    # Coeficiente de penalidade para suavidade (smoothness penalty)
+        self.beta = 0.0001   # Coeficiente de penalidade para buffer
+        self.k = 3           # Número de vizinhos mais próximos (KNN)
+
+        # Contadores e métricas para ajuste dinâmico dos parâmetros
+        self.episode_count = 0  # Contador de episódios
+        self.reward_history = []  # Histórico de recompensas
+        self.parameter_update_interval = 50  # Intervalo para ajustar parâmetros (a cada 50 episódios)
+
+        # Parâmetros de streaming de vídeo
+        self.segment_duration = 2  # Duração de cada segmento de vídeo (em segundos)
+        self.B_safe = 10           # Nível seguro de buffer (em segundos)
         
-        # Video streaming parameters
-        self.segment_duration = 2  # Hardcoded from paper (T_segment)
-        self.B_safe = 10           # Safe buffer level (sec)
-        self.alpha = 50.0          # Penalty coefficients
-        self.beta = 0.001       
+        # Vetor de coeficientes para cálculo aproximado do SSIM (extraído do vídeo BigBuckBunny)
+        self.d = [0.011651186243177895, -0.012434481516153652, -0.0017859401909209828, -3.7032177029078504e-05]
         
-        # SSIM calculation vector d of BigBuckBunny
-        self.d = [0.011651186243177895,-0.012434481516153652, -0.0017859401909209828, -3.7032177029078504e-05]
-        
-        # State tracking
-        self.throughputs = []     # Measured throughput values
-        self.buffer_level = 0     # Current buffer level (sec)
-        self.last_quality = None  # Last selected quality index
-        self.bitrates = []        # Available bitrates from MPD (bps)
-        self.R_max = None         # Max bitrate in representation
-        
-        # KNN-Q Learning components
-        self.replay_buffer = []   # (state, action, reward, next_state)
-        self.tree : KDTree = None          # KDTree for fast lookups
-        self.X = []               # State-action vectors
-        self.y = []               # Q-values
-        self.fitted = False
+        # Rastreamento de estado
+        self.throughputs = []     # Histórico de throughputs medidos
+        self.buffer_level = 0     # Nível atual do buffer (em segundos)
+        self.last_quality = None  # Última qualidade selecionada
+        self.bitrates = []        # Taxas de bits disponíveis no MPD (em bps)
+        self.R_max = None         # Maior taxa de bits disponível
+
+        # Componentes do KNN-Q Learning
+        self.replay_buffer = []   # Buffer de experiências (estado, ação, recompensa, próximo estado)
+        self.tree : KDTree = None # Árvore KD para buscas rápidas de vizinhos mais próximos
+        self.X = []               # Vetores de estado-ação
+        self.y = []               # Valores Q (Q-values)
+        self.fitted = False       # Indica se o modelo foi ajustado
 
     def handle_xml_request(self, msg: SSMessage):
         """
-        Handles XML manifest request by recording request time.
-        
-        Parameters
-        ----------
-        msg : SSMessage
-            Message object containing XML request
+        Manipula a requisição do manifesto XML, registrando o tempo da requisição.
         """
         self.request_time = time.perf_counter()
         self.send_down(msg)
 
     def handle_xml_response(self, msg: SSMessage):
         """
-        Processes MPD response using existing parser to initialize streaming parameters.
-        
-        Parameters
-        ----------
-        msg : SSMessage
-            Message containing MPD XML payload
+        Processa a resposta do MPD, extraindo as representações disponíveis e calculando o throughput inicial.
         """
         parsed_mpd = parse_mpd(msg.get_payload())
         
-        # Extract representations in MPD and calculate SSIM values
+        # Extrai as representações do MPD e calcula o SSIM
         self.qi = parsed_mpd.get_qi()
         self.R_max = max(self.qi) if self.qi else 1
         
-        # Calculate initial throughput (for first segment decision)
+        # Calcula o throughput inicial (para decisão do primeiro segmento)
         t = time.perf_counter() - self.request_time
         self.throughputs.append(msg.get_bit_length() / t)
         
@@ -80,15 +76,10 @@ class R2A_QKNN(IR2A):
 
     def get_state(self):
         """
-        Constructs state vector from current environment observations.
-        
-        Returns
-        -------
-        list
-            [current_throughput, buffer_level, last_quality]
+        Constrói o vetor de estado a partir das observações atuais do ambiente.
         """
-        # Current throughput (5-segment moving average)
-        window = self.throughputs[-5:] if len(self.throughputs) >=5 else self.throughputs
+        # Throughput atual (média móvel dos últimos 5 segmentos)
+        window = self.throughputs[-5:] if len(self.throughputs) >= 5 else self.throughputs
         current_throughput = mean(window) if window else 0
         
         return [
@@ -99,149 +90,133 @@ class R2A_QKNN(IR2A):
 
     def _calculate_ssim(self, quality_idx):
         """
-        Calculates SSIM approximation using paper's equation (1).
-        
-        Parameters
-        ----------
-        quality_idx : int
-            Index of selected quality level
-            
-        Returns
-        -------
-        float
-            Estimated SSIM value
+        Calcula a aproximação do SSIM usando a equação (1) do artigo.
         """
         R_a = quality_idx
         rho = np.log10(R_a / self.R_max)
-        print(f"Rho: {rho}")
         ssim = (1 + \
-            self.d[0]*rho + \
-            self.d[1]*(rho**2) + \
-            self.d[2]*(rho**3) + \
-            self.d[3]*(rho**4))
-        print(f"Quality: {quality_idx}, n\ SSIM: {ssim}")
-        return(ssim)
-        
+            self.d[0] * rho + \
+            self.d[1] * (rho ** 2) + \
+            self.d[2] * (rho ** 3) + \
+            self.d[3] * (rho ** 4))
+        return ssim
 
     def calculate_reward(self, quality, prev_quality, download_time, segment_size):
         """
-        Computes QoE reward using paper's equations (4) and (5).
-        
-        Parameters
-        ----------
-        quality : int
-            Current quality index
-        prev_quality : int
-            Previous quality index
-        download_time : float
-            Time taken to download segment
-        segment_size : int
-            Size of downloaded segment in bits
-            
-        Returns
-        -------
-        float
-            Calculated reward value
+        Calcula a recompensa de QoE usando as equações (4) e (5) do artigo.
         """
-        # Current SSIM calculation
+        # Cálculo do SSIM atual
         ssim = self._calculate_ssim(quality)
         
-        # Smoothness penalty (Δq)
+        # Penalidade de suavidade (Δq)
         if prev_quality is not None:
             prev_ssim = self._calculate_ssim(prev_quality)
             smoothness_penalty = self.alpha * abs(ssim - prev_ssim)
         else:
             smoothness_penalty = 0
 
-        # Buffer penalty (φ(t)) from equation (5)
+        # Penalidade de buffer (φ(t)) da equação (5)
         underflow_risk = max(0, self.B_safe - self.buffer_level)
-        print(f"Buffer: {self.buffer_level}, Underflow: {underflow_risk}")
         overflow = max(self.buffer_level - self.B_safe, 0)
         phi = self.alpha * underflow_risk + self.beta * (overflow ** 2)
 
         print(f"SSIM: {ssim}, Smoothness: {smoothness_penalty}, Phi: {phi}, Reward: {ssim - smoothness_penalty - phi}")
-        
+
         return ssim - smoothness_penalty - phi
 
     def handle_segment_size_request(self, msg: SSMessage):
         """
-        Handles segment request using softmax policy over KNN-predicted Q-values.
-        
-        Parameters
-        ----------
-        msg : SSMessage
-            Segment request message
+        Seleciona a qualidade do próximo segmento usando uma política softmax sobre os valores Q preditos pelo KNN.
         """
         self.request_time = time.perf_counter()
         
-        # Softmax action selection
+        # Seleção de ação via softmax
         state = self.get_state()
         q_values = np.array([self.predict(state + [a]) for a in self.qi])
 
-        # Check for NaNs or if all Q-values are the same
+        # Verifica se há NaNs ou se todos os valores Q são iguais
         if np.any(np.isnan(q_values)):
-            # fallback, e.g. uniform distribution
-            probs = np.ones(len(self.qi)) / len(self.qi)
+            probs = np.ones(len(self.qi)) / len(self.qi)  # Fallback para distribuição uniforme
         else:
-            # Compute stable softmax
-            probs = softmax(q_values / self.tau)
+            probs = softmax(q_values / self.tau)  # Calcula softmax estável
 
         chosen_qi = np.random.choice(self.qi, p=probs)
-        
         msg.add_quality_id(chosen_qi)
         self.send_down(msg)
 
     def handle_segment_size_response(self, msg: SSMessage):
         """
-        Updates learning model with new experience and manages buffer state.
-        
-        Parameters
-        ----------
-        msg : SSMessage
-            Received segment response
+        Atualiza o modelo de aprendizado com novas experiências e gerencia o estado do buffer.
         """
-        # Calculate download metrics
+        # Calcula métricas de download
         download_time = time.perf_counter() - self.request_time
         current_quality = msg.get_quality_id()
         
-        # Update buffer using paper's equation (3)
+        # Atualiza o buffer usando a equação (3) do artigo
         self.buffer_level = max(0, self.buffer_level - download_time) + self.segment_duration
         
-        # Calculate reward and store experience
+        # Calcula a recompensa e armazena a experiência
         state = self.get_state()
         reward = self.calculate_reward(current_quality, self.last_quality, 
                                       download_time, msg.get_bit_length())
         next_state = self.get_state()
         
+        # Atualiza métricas
+        self.episode_count += 1
+        self.reward_history.append(reward)
+
+        # Ajusta os parâmetros a cada 50 episódios
+        if self.episode_count % self.parameter_update_interval == 0:
+            self.adjust_parameters()
+
+        # Atualiza o throughput e a última qualidade selecionada
         self.throughputs.append(msg.get_bit_length() / download_time)
         self.last_quality = current_quality
-        
-        # KNN-Q update
         self.update_replay(state, current_quality, reward, next_state)
         self.fit_knn()
-        
         self.send_up(msg)
+
+    def adjust_parameters(self):
+        """
+        Ajusta os parâmetros do algoritmo com base na recompensa média dos últimos 50 episódios.
+        """
+        if len(self.reward_history) == 0:
+            return
+
+        # Calcula a recompensa média
+        avg_reward = np.mean(self.reward_history)
+        print(f"Episódio {self.episode_count}, Recompensa Média: {avg_reward}")
+
+        # Lógica de ajuste de parâmetros
+        if avg_reward < 0:
+            # Se a recompensa média for negativa, aumenta os parâmetros para explorar mais
+            self.eta = min(self.eta * 1.1, 1.0)  # Aumenta a taxa de aprendizado (até no máximo 1.0)
+            self.gamma = min(self.gamma * 1.05, 0.99)  # Aumenta o fator de desconto (até no máximo 0.99)
+            self.tau = max(self.tau * 0.9, 0.1)  # Reduz a temperatura (explora menos)
+            self.alpha = max(self.alpha * 0.9, 1.0)  # Reduz a penalidade de suavidade
+            self.beta = max(self.beta * 0.9, 0.00001)  # Reduz a penalidade de buffer
+        else:
+            # Se a recompensa média for positiva, ajusta os parâmetros para explorar menos
+            self.eta = max(self.eta * 0.9, 0.01)  # Reduz a taxa de aprendizado (até no mínimo 0.01)
+            self.gamma = max(self.gamma * 0.95, 0.5)  # Reduz o fator de desconto (até no mínimo 0.5)
+            self.tau = min(self.tau * 1.1, 2.0)  # Aumenta a temperatura (explora mais)
+            self.alpha = min(self.alpha * 1.1, 100.0)  # Aumenta a penalidade de suavidade
+            self.beta = min(self.beta * 1.1, 0.01)  # Aumenta a penalidade de buffer
+
+        print(f"Parâmetros ajustados: eta={self.eta}, gamma={self.gamma}, tau={self.tau}, alpha={self.alpha}, beta={self.beta}")
+
+        # Reinicia o histórico de recompensas
+        self.reward_history = []
 
     def update_replay(self, state, action, reward, next_state):
         """
-        Updates replay buffer and performs KNN-based Q-learning update.
-        
-        Parameters
-        ----------
-        state : list
-            Current state vector
-        action : int
-            Selected quality index
-        reward : float
-            Calculated reward value
-        next_state : list
-            Observed next state
+        Atualiza o buffer de replay e realiza a atualização do Q-Learning baseado em KNN.
         """
-        # TD Target calculation
+        # Cálculo do TD Target
         next_q_values = [self.predict(next_state + [a]) for a in self.qi]
         td_target = reward + self.gamma * max(next_q_values)
         
-        # Find nearest neighbors and update
+        # Encontra os vizinhos mais próximos e atualiza
         if self.fitted:
             state_action = state + [action]
             distances, indices = self.tree.query([state_action], k=self.k)
@@ -250,14 +225,14 @@ class R2A_QKNN(IR2A):
                 if idx < len(self.y):
                     self.y[idx] += self.eta * (td_target - self.y[idx])
         
-        # Maintain replay buffer size
+        # Mantém o tamanho do buffer de replay
         if len(self.replay_buffer) > 1000:
             self.replay_buffer.pop(0)
         self.replay_buffer.append((state, action, reward, next_state))
 
     def fit_knn(self):
         """
-        Rebuilds KDTree index from current replay buffer experiences.
+        Reconstrói o índice da árvore KD a partir das experiências atuais no buffer de replay.
         """
         if len(self.replay_buffer) > 0:
             self.X = [s + [a] for (s, a, _, _) in self.replay_buffer]
@@ -270,17 +245,7 @@ class R2A_QKNN(IR2A):
 
     def predict(self, state_action):
         """
-        Predicts Q-value using weighted average of nearest neighbors.
-        
-        Parameters
-        ----------
-        state_action : list
-            Combined state-action vector
-            
-        Returns
-        -------
-        float
-            Predicted Q-value
+        Prediz o valor Q usando a média ponderada dos vizinhos mais próximos.
         """
         if not self.fitted or len(self.y) == 0:
             return 0
@@ -289,11 +254,10 @@ class R2A_QKNN(IR2A):
             np.array(state_action).reshape(1, -1),
             k=min(self.k, len(self.y))
         )
-        
         if len(indices) == 0:
             return 0
             
-        # Weighted average of neighbor rewards
+        # Média ponderada das recompensas dos vizinhos
         weights = 1 / (distances.flatten() + 1e-6)
         return np.average([self.y[i] for i in indices.flatten()], weights=weights)
 

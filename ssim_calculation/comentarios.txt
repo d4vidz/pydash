@@ -1,0 +1,60 @@
+Comentários sobre o código:
+Classe R2A_QKNN:
+
+Herda da classe IR2A, que é uma interface para algoritmos de adaptação de taxa.
+
+Implementa um algoritmo de adaptação de taxa baseado em KNN e Q-Learning, focado em maximizar a QoE (Quality of Experience) do usuário.
+
+Método __init__:
+
+Inicializa os parâmetros do algoritmo, como taxa de aprendizado (eta), fator de desconto (gamma), e coeficientes de penalidade (alpha e beta).
+
+Define variáveis para rastrear o estado do sistema, como throughputs, buffer_level, e last_quality.
+
+Método handle_xml_request:
+
+Registra o tempo da requisição do manifesto XML.
+
+Método handle_xml_response:
+
+Processa a resposta do MPD, extrai as representações disponíveis e calcula o throughput inicial.
+
+Método get_state:
+
+Constrói o vetor de estado a partir das observações atuais, como throughput, nível do buffer e última qualidade selecionada.
+
+Método _calculate_ssim:
+
+Calcula a aproximação do SSIM (Structural Similarity Index) usando uma equação polinomial.
+
+Método calculate_reward:
+
+Calcula a recompensa de QoE com base no SSIM, penalidades de suavidade e buffer.
+
+Método handle_segment_size_request:
+
+Seleciona a qualidade do próximo segmento usando uma política softmax sobre os valores Q preditos pelo KNN.
+
+Método handle_segment_size_response:
+
+Atualiza o modelo de aprendizado com novas experiências, gerencia o estado do buffer e ajusta os parâmetros do algoritmo.
+
+Método adjust_parameters:
+
+Ajusta os parâmetros do algoritmo com base na recompensa média dos últimos 50 episódios.
+
+Método update_replay:
+
+Atualiza o buffer de replay e realiza a atualização do Q-Learning baseado em KNN.
+
+Método fit_knn:
+
+Reconstrói o índice da árvore KD a partir das experiências atuais no buffer de replay.
+
+Método predict:
+
+Prediz o valor Q usando a média ponderada dos vizinhos mais próximos.
+
+Métodos initialize e finalization:
+
+Métodos vazios que podem ser implementados para inicialização e finalização do algoritmo.

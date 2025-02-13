@@ -2,7 +2,7 @@
 r2a/r2afdash.py
 .DS_Store
 .idea/
-
+*.mp4
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
