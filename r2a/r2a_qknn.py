@@ -22,7 +22,7 @@ class R2A_QKNN(IR2A):
         self.gamma = 0.9     # Fator de desconto (discount factor)
         self.tau = 0.5       # Escala de temperatura para softmax
         self.alpha = 10.0    # Coeficiente de penalidade para suavidade (smoothness penalty)
-        self.beta = 0.0001   # Coeficiente de penalidade para buffer
+        self.beta = 0.001   # Coeficiente de penalidade para buffer
         self.k = 3           # Número de vizinhos mais próximos (KNN)
 
         # Contadores e métricas para ajuste dinâmico dos parâmetros
@@ -32,7 +32,7 @@ class R2A_QKNN(IR2A):
 
         # Parâmetros de streaming de vídeo
         self.segment_duration = 2  # Duração de cada segmento de vídeo (em segundos)
-        self.B_safe = 10           # Nível seguro de buffer (em segundos)
+        self.B_safe = 15           # Nível seguro de buffer (em segundos)
         
         # Vetor de coeficientes para cálculo aproximado do SSIM (extraído do vídeo BigBuckBunny)
         self.d = [0.011651186243177895, -0.012434481516153652, -0.0017859401909209828, -3.7032177029078504e-05]
@@ -195,7 +195,7 @@ class R2A_QKNN(IR2A):
                 self.gamma = min(self.gamma * 1.05, 0.99)  # Aumenta o fator de desconto (até no máximo 0.99)
                 self.tau = max(self.tau * 0.9, 0.1)  # Reduz a temperatura (explora menos)
                 self.alpha = max(self.alpha * 0.9, 1.0)  # Reduz a penalidade de suavidade
-                self.beta = max(self.beta * 0.9, 0.00001)  # Reduz a penalidade de buffer
+                self.beta = max(self.beta * 0.9, 0.001)  # Reduz a penalidade de buffer
             else:
                 # Se a recompensa média for positiva, ajusta os parâmetros para explorar menos
                 self.eta = max(self.eta * 0.9, 0.01)  # Reduz a taxa de aprendizado (até no mínimo 0.01)
