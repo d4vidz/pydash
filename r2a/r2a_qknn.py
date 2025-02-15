@@ -28,14 +28,14 @@ class R2A_QKNN(IR2A):
         # Contadores e métricas para ajuste dinâmico dos parâmetros
         self.episode_count = 0  # Contador de episódios
         self.reward_history = []  # Histórico de recompensas
-        self.parameter_update_interval = 25  # Intervalo para ajustar parâmetros (a cada 50 episódios)
+        self.parameter_update_interval = 10  # Intervalo para ajustar parâmetros (a cada 50 episódios)
 
         # Parâmetros de streaming de vídeo
-        self.segment_duration = 2  # Duração de cada segmento de vídeo (em segundos)
+        self.segment_duration = 1  # Duração de cada segmento de vídeo (em segundos)
         self.B_safe = 15           # Nível seguro de buffer (em segundos)
         
         # Vetor de coeficientes para cálculo aproximado do SSIM (extraído do vídeo BigBuckBunny)
-        self.d = [0.011651186243177895, -0.012434481516153652, -0.0017859401909209828, -3.7032177029078504e-05]
+        self.d = [0.017901738412493887, -0.006908148312984288, -0.00017270496637129657, 0.00010360865155566306]
         
         # Rastreamento de estado
         self.throughputs = []     # Histórico de throughputs medidos
@@ -196,25 +196,33 @@ class R2A_QKNN(IR2A):
                 self.tau = max(self.tau * 0.9, 0.1)  # Reduz a temperatura (explora menos)
                 self.alpha = max(self.alpha * 0.9, 1.0)  # Reduz a penalidade de suavidade
                 self.beta = max(self.beta * 0.9, 0.001)  # Reduz a penalidade de buffer
+                self.parameter_update_interval = max(self.parameter_update_interval - 5, 10) #Reduz o intervalo para ajustar mais rápido
             else:
                 # Se a recompensa média for positiva, ajusta os parâmetros para explorar menos
                 self.eta = max(self.eta * 0.9, 0.01)  # Reduz a taxa de aprendizado (até no mínimo 0.01)
                 self.gamma = max(self.gamma * 0.95, 0.5)  # Reduz o fator de desconto (até no mínimo 0.5)
                 self.tau = min(self.tau * 1.1, 2.0)  # Aumenta a temperatura (explora mais)
                 self.alpha = min(self.alpha * 1.1, 100.0)  # Aumenta a penalidade de suavidade
-                self.beta = min(self.beta * 1.1, 0.01)  # Aumenta a penalidade de buffer
+                # Ajusta as penalidades com base em métricas específicas
+                if self.buffer_level < self.B_safe:
+                    # Se o buffer estiver abaixo do nível seguro, reduz a penalidade de buffer
+                    self.beta = max(self.beta * 0.9, 0.001)
+                else:
+                    # Se o buffer estiver acima do nível seguro, aumenta a penalidade de buffer
+                    self.beta = min(self.beta * 1.1, 0.01)
 
             # Ajuste dinâmico do valor de k
             if avg_reward < 0:
                 # Se a recompensa média for negativa, aumenta k para explorar mais
-                self.k = min(self.k + 1, 5)  # Aumenta k (até no máximo 10)
+                self.k = min(self.k + 1, 5)  # Aumenta k (até no máximo 5)
             elif avg_reward < 0.6:
                 # Se a recompensa média for positiva, reduz k para explorar menos
-                self.k = max(self.k - 1, 3)  # Reduz k (até no mínimo 1)
+                self.k = max(self.k - 1, 3)  # Reduz k (até no mínimo 3)
 
             print(f"Parâmetros ajustados: eta={self.eta}, gamma={self.gamma}, tau={self.tau}, alpha={self.alpha}, beta={self.beta}, k={self.k}")
         else:
             print("Recompensa média acima de 0.6. Parâmetros não ajustados.")
+            self.parameter_update_interval = min(self.parameter_update_interval + 5, 50)
 
         # Reinicia o histórico de recompensas
         self.reward_history = []

@@ -30,7 +30,7 @@ bitrates = np.array(bitrates)
 ssim_values = np.array(ssim_values)
 
 # Normalizar os bitrates
-R1 = 4219897
+R1 = 4726737
 normalized_bitrates = bitrates / R1
 log_normalized_bitrates = np.log(normalized_bitrates)
 
