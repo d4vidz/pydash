@@ -22,20 +22,20 @@ class R2A_QKNN(IR2A):
         self.gamma = 0.9     # Fator de desconto (discount factor)
         self.tau = 0.5       # Escala de temperatura para softmax
         self.alpha = 10.0    # Coeficiente de penalidade para suavidade (smoothness penalty)
-        self.beta = 0.001   # Coeficiente de penalidade para buffer
+        self.beta = 0.001    # Coeficiente de penalidade para buffer
         self.k = 3           # Número de vizinhos mais próximos (KNN)
 
         # Contadores e métricas para ajuste dinâmico dos parâmetros
         self.episode_count = 0  # Contador de episódios
         self.reward_history = []  # Histórico de recompensas
-        self.parameter_update_interval = 25  # Intervalo para ajustar parâmetros (a cada 50 episódios)
+        self.parameter_update_interval = 25  # Intervalo para ajustar parâmetros (a cada 25 episódios)
 
         # Parâmetros de streaming de vídeo
-        self.segment_duration = 2  # Duração de cada segmento de vídeo (em segundos)
-        self.B_safe = 15           # Nível seguro de buffer (em segundos)
+        self.segment_duration = 1  # Duração de cada segmento de vídeo (em segundos)
+        self.B_safe = 20           # Nível seguro de buffer (em segundos)
         
         # Vetor de coeficientes para cálculo aproximado do SSIM (extraído do vídeo BigBuckBunny)
-        self.d = [0.011651186243177895, -0.012434481516153652, -0.0017859401909209828, -3.7032177029078504e-05]
+        self.d = [0.019461573115159666, -0.006841383835947878, -0.00021971195971874776, 0.0001036086515555905]
         
         # Rastreamento de estado
         self.throughputs = []     # Histórico de throughputs medidos
@@ -77,6 +77,10 @@ class R2A_QKNN(IR2A):
     def get_state(self):
         """
         Constrói o vetor de estado a partir das observações atuais do ambiente.
+        Retorna um vetor contendo:
+        - Throughput atual (média móvel dos últimos 5 segmentos)
+        - Nível atual do buffer
+        - Última qualidade selecionada
         """
         # Throughput atual (média móvel dos últimos 5 segmentos)
         window = self.throughputs[-5:] if len(self.throughputs) >= 5 else self.throughputs
@@ -104,6 +108,10 @@ class R2A_QKNN(IR2A):
     def calculate_reward(self, quality, prev_quality, download_time, segment_size):
         """
         Calcula a recompensa de QoE usando as equações (4) e (5) do artigo.
+        A recompensa é composta por:
+        - SSIM: Medida de qualidade do vídeo
+        - Penalidade de suavidade: Penaliza mudanças bruscas na qualidade
+        - Penalidade de buffer: Penaliza riscos de underflow ou overflow do buffer
         """
         # Cálculo do SSIM atual
         ssim = self._calculate_ssim(quality)
@@ -114,11 +122,12 @@ class R2A_QKNN(IR2A):
             smoothness_penalty = self.alpha * abs(ssim - prev_ssim)
         else:
             smoothness_penalty = 0
-
+        
         # Penalidade de buffer (φ(t)) da equação (5)
-        underflow_risk = max(0, self.B_safe - self.buffer_level)
-        overflow = max(self.buffer_level - self.B_safe, 0)
-        phi = self.alpha * underflow_risk + self.beta * (overflow ** 2)
+        b_1 = max(0, self.buffer_level - download_time) + segment_size
+        underflow_risk = max(0, download_time - (self.buffer_level / 100)) 
+        overflow = max(self.B_safe - b_1, 0)
+        phi = min(self.alpha * underflow_risk, 1) + self.beta * (overflow ** 2)
 
         print(f"SSIM: {ssim}, Smoothness: {smoothness_penalty}, Phi: {phi}, Reward: {ssim - smoothness_penalty - phi}, {self.episode_count}")
 
@@ -165,8 +174,8 @@ class R2A_QKNN(IR2A):
         self.episode_count += 1
         self.reward_history.append(reward)
 
-        # Ajusta os parâmetros a cada 50 episódios
-        if self.episode_count == self.parameter_update_interval :
+        # Ajusta os parâmetros a cada 25 episódios
+        if self.episode_count == self.parameter_update_interval:
             self.adjust_parameters()
             self.episode_count = 0
 
@@ -179,42 +188,35 @@ class R2A_QKNN(IR2A):
 
     def adjust_parameters(self):
         """
-        Ajusta os parâmetros do algoritmo com base na recompensa média dos últimos 50 episódios.
-        Só ajusta os parâmetros se a recompensa média for menor que 0.6.
+        Ajusta os parâmetros do algoritmo com base na recompensa média e no nível do buffer.
         """
         # Calcula a recompensa média
         avg_reward = np.mean(self.reward_history)
         print(f"Episódio {self.episode_count}, Recompensa Média: {avg_reward}")
 
-        # Só ajusta os parâmetros se a recompensa média for menor que 0.6
-        if avg_reward < 0.6:
-            # Lógica de ajuste de parâmetros principais
-            if avg_reward < 0:
-                # Se a recompensa média for negativa, aumenta os parâmetros para explorar mais
-                self.eta = min(self.eta * 1.1, 1.0)  # Aumenta a taxa de aprendizado (até no máximo 1.0)
-                self.gamma = min(self.gamma * 1.05, 0.99)  # Aumenta o fator de desconto (até no máximo 0.99)
-                self.tau = max(self.tau * 0.9, 0.1)  # Reduz a temperatura (explora menos)
-                self.alpha = max(self.alpha * 0.9, 1.0)  # Reduz a penalidade de suavidade
-                self.beta = max(self.beta * 0.9, 0.001)  # Reduz a penalidade de buffer
-            else:
-                # Se a recompensa média for positiva, ajusta os parâmetros para explorar menos
-                self.eta = max(self.eta * 0.9, 0.01)  # Reduz a taxa de aprendizado (até no mínimo 0.01)
-                self.gamma = max(self.gamma * 0.95, 0.5)  # Reduz o fator de desconto (até no mínimo 0.5)
-                self.tau = min(self.tau * 1.1, 2.0)  # Aumenta a temperatura (explora mais)
-                self.alpha = min(self.alpha * 1.1, 100.0)  # Aumenta a penalidade de suavidade
-                self.beta = min(self.beta * 1.1, 0.01)  # Aumenta a penalidade de buffer
-
-            # Ajuste dinâmico do valor de k
-            if avg_reward < 0:
-                # Se a recompensa média for negativa, aumenta k para explorar mais
-                self.k = min(self.k + 1, 5)  # Aumenta k (até no máximo 10)
-            elif avg_reward < 0.6:
-                # Se a recompensa média for positiva, reduz k para explorar menos
-                self.k = max(self.k - 1, 3)  # Reduz k (até no mínimo 1)
-
-            print(f"Parâmetros ajustados: eta={self.eta}, gamma={self.gamma}, tau={self.tau}, alpha={self.alpha}, beta={self.beta}, k={self.k}")
+        # Ajusta outros parâmetros conforme necessário
+        if avg_reward < 0.5:
+            self.eta = min(self.eta * 1.1, 1.0)
+            self.gamma = min(self.gamma * 1.05, 0.99)
+            self.tau = max(self.tau * 0.9, 0.1)
+            self.alpha = max(self.alpha * 0.9, 1.0)
+            self.beta = max(self.beta * 1.1, 0.001)
         else:
-            print("Recompensa média acima de 0.6. Parâmetros não ajustados.")
+            if hasattr(self, 'prev_eta'):
+                self.eta = 0.9 * self.prev_eta + 0.1 * self.eta
+                self.gamma = 0.9 * self.prev_gamma + 0.1 * self.gamma
+                self.tau = 0.9 * self.prev_tau + 0.1 * self.tau
+                self.alpha = 0.9 * self.prev_alpha + 0.1 * self.alpha
+                self.beta = 0.9 * self.prev_beta + 0.1 * self.alpha
+
+        # Armazena valores anteriores para suavização futura
+        self.prev_eta = self.eta
+        self.prev_gamma = self.gamma
+        self.prev_tau = self.tau
+        self.prev_alpha = self.alpha
+        self.prev_beta = self.beta
+
+        print(f"Parâmetros ajustados: eta={self.eta}, gamma={self.gamma}, tau={self.tau}, alpha={self.alpha}, beta={self.beta}, k={self.k}")
 
         # Reinicia o histórico de recompensas
         self.reward_history = []
