@@ -1,3 +1,6 @@
+#Artur Ferreira / 211066300
+#Daniel Alves / 221035424
+#David Zimmermann / 200016822
 from r2a.ir2a import IR2A
 from base.message import SSMessage
 from player.parser import *
